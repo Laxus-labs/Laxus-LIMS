@@ -1,0 +1,382 @@
+"""
+Sample accessioning, custody transfer, aliquoting, and disposal.
+
+Every function here is a *domain operation*, not a CRUD wrapper. The
+difference matters: "move this sample to box A1 position C7" is one atomic
+business event with a custody consequence, and exposing it as
+`PATCH /samples/{id} {location: ...}` would let a caller construct states
+the lab's rules forbid. Views call these; they do not reimplement them.
+
+Audit rows are emitted by database triggers rather than by this module (see
+apps/audit/migrations/0002). What this module supplies is the *reason* —
+the "why" that a trigger cannot infer — via the transaction-scoped context
+in apps.audit.context.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+from dataclasses import dataclass
+from decimal import Decimal
+
+from django.db import IntegrityError, transaction
+from django.db.models import F, Q
+from django.utils import timezone
+
+from apps.audit import context as audit_context
+from apps.storage.models import LocationType, StorageLocation
+
+from .errors import (
+    IllegalTransition,
+    InsufficientVolume,
+    InvalidPosition,
+    PermissionDenied,
+    PositionOccupied,
+    ReasonRequired,
+)
+from .models import ALLOWED_TRANSITIONS, Sample, SamplePlacement, SampleState
+
+
+@dataclass
+class BatchResult:
+    """Outcome of a batch scan — deliberately reports duplicates separately."""
+
+    created: list[Sample]
+    duplicates: list[Sample]
+
+    @property
+    def total_scanned(self) -> int:
+        return len(self.created) + len(self.duplicates)
+
+
+def _next_accession_number(prefix: str = "ACC") -> str:
+    """
+    Sequential, human-readable lab identifier.
+
+    Derived from a Postgres sequence rather than `count() + 1`, which races
+    under concurrent accessioning and would hand two samples the same
+    number. The sequence is created on first use.
+    """
+    from django.db import connection
+
+    with connection.cursor() as cursor:
+        cursor.execute("CREATE SEQUENCE IF NOT EXISTS accession_number_seq")
+        cursor.execute("SELECT nextval('accession_number_seq')")
+        value = cursor.fetchone()[0]
+    return f"{prefix}-{timezone.now():%Y}-{value:06d}"
+
+
+@transaction.atomic
+def accession_batch(
+    *,
+    scans: list[dict],
+    user,
+    reason_code: str = "BATCH_ACCESSION",
+) -> BatchResult:
+    """
+    Ingest a batch of barcode scans idempotently.
+
+    Handheld scanners double-fire, operators re-scan a rack they are unsure
+    about, and flaky networks cause clients to resubmit. All three produce
+    duplicate barcodes in one payload or across retries. Rather than
+    erroring — which would make the operator re-do a 96-well rack because
+    one tube was scanned twice — duplicates are recognised and reported
+    back separately.
+
+    Idempotency rests on the unique constraint on `barcode`, not on a
+    pre-check. A `SELECT ... then INSERT` would still race two concurrent
+    batches containing the same tube; letting the constraint arbitrate and
+    catching the violation cannot.
+    """
+    created: list[Sample] = []
+    duplicates: list[Sample] = []
+    seen_in_payload: set[str] = set()
+
+    with audit_context.reason(reason_code, f"Batch of {len(scans)} scans."):
+        for scan in scans:
+            barcode = str(scan["barcode"]).strip()
+            if not barcode:
+                continue
+
+            # Collapse duplicates within a single payload before touching
+            # the database at all.
+            if barcode in seen_in_payload:
+                existing = Sample.objects.filter(barcode=barcode).first()
+                if existing:
+                    duplicates.append(existing)
+                continue
+            seen_in_payload.add(barcode)
+
+            try:
+                # Savepoint so one duplicate does not abort the whole batch.
+                with transaction.atomic():
+                    sample = Sample.objects.create(
+                        barcode=barcode,
+                        sample_type=scan["sample_type"],
+                        state=SampleState.RECEIVED,
+                        volume=Decimal(str(scan.get("volume", 0))),
+                        volume_unit=scan.get("volume_unit", "uL"),
+                        subject_ref=scan.get("subject_ref", ""),
+                        collected_at=scan.get("collected_at"),
+                        received_at=scan.get("received_at") or timezone.now(),
+                        expires_at=scan.get("expires_at"),
+                        metadata=scan.get("metadata", {}),
+                        created_by=user,
+                    )
+            except IntegrityError:
+                duplicates.append(Sample.objects.get(barcode=barcode))
+                continue
+
+            created.append(sample)
+
+    return BatchResult(created=created, duplicates=duplicates)
+
+
+@transaction.atomic
+def accession(*, sample: Sample, user, reason_code: str = "ACCESSION") -> Sample:
+    """Assign a lab identifier and advance out of RECEIVED."""
+    sample = Sample.objects.select_for_update().get(pk=sample.pk)
+    _assert_transition(sample, SampleState.ACCESSIONED)
+
+    with audit_context.reason(reason_code):
+        sample.accession_number = sample.accession_number or _next_accession_number()
+        sample.accessioned_at = timezone.now()
+        sample.state = SampleState.ACCESSIONED
+        sample.save(update_fields=["accession_number", "accessioned_at", "state", "updated_at"])
+    return sample
+
+
+@transaction.atomic
+def transfer(
+    *,
+    sample: Sample,
+    location: StorageLocation,
+    user,
+    row_label: str = "",
+    column_number: int | None = None,
+    reason_code: str = "TRANSFER",
+    reason_text: str = "",
+) -> SamplePlacement:
+    """
+    Move a sample to a location, closing its previous placement.
+
+    Closing the old row and opening the new one happen in one transaction,
+    so the sample is never in two places and never in none.
+    """
+    if location.location_type == LocationType.BOX:
+        if column_number is None or not row_label:
+            raise InvalidPosition(
+                f"{location} is a box and requires a row and column."
+            )
+        if not location.valid_position(row_label, column_number):
+            raise InvalidPosition(
+                f"{row_label}{column_number} is outside {location}'s "
+                f"{location.grid_rows}x{location.grid_cols} grid."
+            )
+    elif column_number is not None:
+        raise InvalidPosition(f"{location} has no grid, so it takes no coordinate.")
+
+    # Re-read under lock rather than trusting the caller's instance. A
+    # Sample handed in by a view may have been disposed by another request
+    # since it was loaded, and an in-memory `state` would happily let us
+    # move a sample that no longer physically exists.
+    sample = Sample.objects.select_for_update().get(pk=sample.pk)
+
+    if sample.state in {SampleState.DISPOSED, SampleState.EXHAUSTED}:
+        raise IllegalTransition(sample.pk, sample.state, "moved")
+
+    with audit_context.reason(reason_code, reason_text):
+        SamplePlacement.objects.filter(sample=sample, removed_at__isnull=True).update(
+            removed_at=timezone.now(), removed_by=user, reason_code=reason_code
+        )
+        try:
+            with transaction.atomic():
+                placement = SamplePlacement.objects.create(
+                    sample=sample,
+                    location=location,
+                    row_label=row_label.upper(),
+                    column_number=column_number,
+                    placed_by=user,
+                    reason_code=reason_code,
+                )
+        except IntegrityError as exc:
+            # The partial unique index on (location, row, col) is what makes
+            # two technicians scanning the same well concurrently safe. One
+            # of them lands here.
+            raise PositionOccupied(
+                f"Position {row_label}{column_number} in {location} is already occupied."
+            ) from exc
+
+    return placement
+
+
+@transaction.atomic
+def aliquot(
+    *,
+    parent: Sample,
+    count: int,
+    volume_each: Decimal,
+    user,
+    barcodes: list[str] | None = None,
+    reason_code: str = "ALIQUOT",
+) -> list[Sample]:
+    """
+    Derive `count` child samples from `parent`, drawing volume from it.
+
+    The parent is locked for the duration: two benches aliquoting the same
+    tube concurrently would otherwise both read the same starting volume
+    and between them take more than exists. Same class of bug as
+    overselling stock, same fix.
+
+    Children inherit subject and type — an aliquot of a patient's serum is
+    still that patient's serum, and losing that link would break the chain
+    of custody the whole system exists to maintain.
+    """
+    if count < 1:
+        raise ValueError("Aliquot count must be at least 1.")
+    volume_each = Decimal(str(volume_each))
+    if volume_each <= 0:
+        raise ValueError("Aliquot volume must be positive.")
+
+    parent = Sample.objects.select_for_update().get(pk=parent.pk)
+
+    if parent.state not in {
+        SampleState.ACCESSIONED,
+        SampleState.IN_STORAGE,
+        SampleState.IN_TESTING,
+        SampleState.ALIQUOTED,
+    }:
+        raise IllegalTransition(parent.pk, parent.state, SampleState.ALIQUOTED)
+
+    total = volume_each * count
+    if total > parent.volume:
+        raise InsufficientVolume(parent.pk, total, parent.volume)
+
+    if barcodes is not None and len(barcodes) != count:
+        raise ValueError(f"Expected {count} barcodes, got {len(barcodes)}.")
+
+    children: list[Sample] = []
+    with audit_context.reason(reason_code, f"{count} aliquots of {volume_each} each."):
+        root = parent.root or parent
+        for i in range(count):
+            barcode = (
+                barcodes[i]
+                if barcodes
+                else f"{parent.barcode}-A{parent.children.count() + i + 1:02d}"
+            )
+            children.append(
+                Sample.objects.create(
+                    barcode=barcode,
+                    sample_type=parent.sample_type,
+                    state=SampleState.ACCESSIONED,
+                    parent=parent,
+                    root=root,
+                    generation=parent.generation + 1,
+                    volume=volume_each,
+                    volume_unit=parent.volume_unit,
+                    subject_ref=parent.subject_ref,
+                    collected_at=parent.collected_at,
+                    received_at=parent.received_at,
+                    accessioned_at=timezone.now(),
+                    expires_at=parent.expires_at,
+                    metadata={"derived_from": str(parent.pk)},
+                    created_by=user,
+                )
+            )
+
+        Sample.objects.filter(pk=parent.pk).update(volume=F("volume") - total)
+        parent.refresh_from_db(fields=["volume"])
+
+        # A parent whose volume reached zero is exhausted, not merely
+        # aliquoted — the distinction drives whether it can be tested again.
+        new_state = (
+            SampleState.EXHAUSTED if parent.volume <= 0 else SampleState.ALIQUOTED
+        )
+        if parent.can_transition_to(new_state):
+            Sample.objects.filter(pk=parent.pk).update(state=new_state)
+
+    return children
+
+
+@transaction.atomic
+def transition(
+    *, sample: Sample, new_state: str, user, reason_code: str = "", reason_text: str = ""
+) -> Sample:
+    """Move a sample through its lifecycle, with the reason recorded."""
+    sample = Sample.objects.select_for_update().get(pk=sample.pk)
+    _assert_transition(sample, new_state)
+
+    # Terminal and irreversible actions must be explained. This is the
+    # difference between an audit trail that answers "why" and one that
+    # only answers "what".
+    if new_state in {SampleState.DISPOSED, SampleState.REJECTED} and not reason_code:
+        raise ReasonRequired(f"Moving a sample to '{new_state}' requires a reason code.")
+
+    if new_state == SampleState.DISPOSED and not getattr(user, "can_dispose_samples", False):
+        raise PermissionDenied("This role may not dispose of samples.")
+
+    with audit_context.reason(reason_code, reason_text):
+        sample.state = new_state
+        fields = ["state", "updated_at"]
+        if new_state == SampleState.DISPOSED:
+            sample.disposed_at = timezone.now()
+            fields.append("disposed_at")
+            SamplePlacement.objects.filter(sample=sample, removed_at__isnull=True).update(
+                removed_at=timezone.now(), removed_by=user, reason_code=reason_code
+            )
+        sample.save(update_fields=fields)
+
+    return sample
+
+
+def lineage(sample: Sample):
+    """Every sample sharing this one's root, ancestors and descendants alike."""
+    root_id = sample.root_id or sample.pk
+    return Sample.objects.filter(Q(pk=root_id) | Q(root_id=root_id)).order_by(
+        "generation", "created_at"
+    )
+
+
+def contents_of(location: StorageLocation, *, include_descendants: bool = True):
+    """
+    Samples currently held in a location.
+
+    With `include_descendants`, this is a single indexed ltree query rather
+    than a recursive walk — the reason the hierarchy uses a materialised
+    path at all. "What is in Freezer 3?" spans shelves, racks and boxes and
+    is the most common question the storage UI asks.
+    """
+    placements = SamplePlacement.objects.filter(removed_at__isnull=True)
+    if include_descendants:
+        if not location.path:
+            # An empty ltree is an ancestor of everything, so proceeding
+            # would return the entire sample table as "contents of this
+            # freezer". Refuse loudly instead of answering wrongly.
+            raise ValueError(
+                f"Location {location.pk} has no materialised path; "
+                "refusing a subtree query that would match every sample."
+            )
+        placements = placements.filter(location__path__descendant_of=location.path)
+    else:
+        placements = placements.filter(location=location)
+    return Sample.objects.filter(pk__in=placements.values("sample_id"))
+
+
+def expiring_within(days: int):
+    """Samples whose stability window closes soon — a daily operational report."""
+    horizon = timezone.now() + dt.timedelta(days=days)
+    return Sample.objects.filter(
+        expires_at__isnull=False,
+        expires_at__lte=horizon,
+        state__in=[
+            SampleState.ACCESSIONED,
+            SampleState.IN_STORAGE,
+            SampleState.IN_TESTING,
+            SampleState.ALIQUOTED,
+        ],
+    ).order_by("expires_at")
+
+
+def _assert_transition(sample: Sample, new_state: str) -> None:
+    if new_state not in ALLOWED_TRANSITIONS.get(sample.state, set()):
+        raise IllegalTransition(sample.pk, sample.state, new_state)
