@@ -123,6 +123,7 @@ REST_FRAMEWORK = {
     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
     "DEFAULT_PAGINATION_CLASS": "rest_framework.pagination.CursorPagination",
     "PAGE_SIZE": 50,
+    "EXCEPTION_HANDLER": "config.exceptions.lims_exception_handler",
 }
 
 SPECTACULAR_SETTINGS = {
