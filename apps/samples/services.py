@@ -24,6 +24,8 @@ from django.db.models import F, Q
 from django.utils import timezone
 
 from apps.audit import context as audit_context
+from apps.audit import signatures as audit_signatures
+from apps.audit.models import ElectronicSignature
 from apps.storage.models import LocationType, StorageLocation
 
 from .errors import (
@@ -256,13 +258,14 @@ def reject_sample(
     sample: Sample,
     user,
     rejection_reason_code: str,
+    password: str = "",
     reason_text: str = "",
     checklist: dict[str, bool | None] | None = None,
 ) -> Sample:
     """
     Reject a sample before testing begins.
 
-    Two invariants are enforced twice, same pattern as everywhere else in
+    Three invariants are enforced twice, same pattern as everywhere else in
     this module: a readable error here, and a CHECK constraint on `sample`
     that holds regardless of which code path performed the write —
     `sample_rejected_requires_reason` and
@@ -274,6 +277,9 @@ def reject_sample(
       approve step; the actor calling this *is* the QA approval, recorded
       as `qa_approved_by` — the same shape as `can_dispose_samples` gating
       `transition()` to DISPOSED.
+    - The rejection must be signed (apps.audit.signatures.sign), which
+      re-authenticates the caller with `password` — being logged in is not
+      the same as affirming, right now, "I am rejecting this sample".
     """
     if not getattr(user, "can_approve_qa", False):
         raise PermissionDenied("This role may not reject samples; QA approval is required.")
@@ -289,6 +295,19 @@ def reject_sample(
 
     sample = Sample.objects.select_for_update().get(pk=sample.pk)
     _assert_transition(sample, SampleState.REJECTED)
+
+    audit_signatures.sign(
+        signer=user,
+        password=password,
+        meaning=ElectronicSignature.Meaning.REJECTED,
+        table_name="sample",
+        record_pk=sample.pk,
+        record_state={
+            "barcode": sample.barcode,
+            "rejection_reason": reason.code,
+            "reason_text": reason_text,
+        },
+    )
 
     with audit_context.reason(f"REJECT:{reason.code}", reason_text):
         fields = _apply_checklist(sample, checklist or {})
@@ -481,9 +500,20 @@ def aliquot(
 
 @transaction.atomic
 def transition(
-    *, sample: Sample, new_state: str, user, reason_code: str = "", reason_text: str = ""
+    *,
+    sample: Sample,
+    new_state: str,
+    user,
+    reason_code: str = "",
+    reason_text: str = "",
+    password: str = "",
 ) -> Sample:
-    """Move a sample through its lifecycle, with the reason recorded."""
+    """Move a sample through its lifecycle, with the reason recorded.
+
+    `password` is only required (and only used) when moving to DISPOSED —
+    disposal is signed (ElectronicSignature.Meaning.DISPOSED), the same
+    re-authentication requirement as apps.samples.services.reject_sample.
+    """
     sample = Sample.objects.select_for_update().get(pk=sample.pk)
     _assert_transition(sample, new_state)
 
@@ -493,8 +523,17 @@ def transition(
     if new_state in {SampleState.DISPOSED, SampleState.REJECTED} and not reason_code:
         raise ReasonRequired(f"Moving a sample to '{new_state}' requires a reason code.")
 
-    if new_state == SampleState.DISPOSED and not getattr(user, "can_dispose_samples", False):
-        raise PermissionDenied("This role may not dispose of samples.")
+    if new_state == SampleState.DISPOSED:
+        if not getattr(user, "can_dispose_samples", False):
+            raise PermissionDenied("This role may not dispose of samples.")
+        audit_signatures.sign(
+            signer=user,
+            password=password,
+            meaning=ElectronicSignature.Meaning.DISPOSED,
+            table_name="sample",
+            record_pk=sample.pk,
+            record_state={"barcode": sample.barcode, "reason_code": reason_code, "reason_text": reason_text},
+        )
 
     with audit_context.reason(reason_code, reason_text):
         sample.state = new_state
@@ -561,3 +600,75 @@ def expiring_within(days: int):
 def _assert_transition(sample: Sample, new_state: str) -> None:
     if new_state not in ALLOWED_TRANSITIONS.get(sample.state, set()):
         raise IllegalTransition(sample.pk, sample.state, new_state)
+
+
+# --- turnaround time / SLA / retention --------------------------------------
+# These read the clock rather than a stored column — see the field
+# docstrings on Sample for why expected-completion and TAT status are
+# computed here, not written anywhere.
+
+def sla_status(sample: Sample) -> dict:
+    """Where a sample stands against its turnaround commitment, computed
+    from its non-cancelled test orders' due dates and, failing that, the
+    committed_report_date agreed with the customer at accessioning."""
+    from apps.testing.models import TestOrderStatus
+
+    now = timezone.now()
+    orders = sample.test_orders.exclude(status=TestOrderStatus.CANCELLED)
+    open_due_dates = [
+        o.due_at
+        for o in orders
+        if o.due_at and o.status != TestOrderStatus.COMPLETE
+    ]
+    expected_completion_date = max(open_due_dates) if open_due_dates else sample.committed_report_date
+
+    if sample.actual_completion_date:
+        tat_status = "complete"
+    elif expected_completion_date is None:
+        # Nothing to judge against: no open order carries a due date, and
+        # no committed_report_date was agreed with the customer.
+        tat_status = "no_orders"
+    elif expected_completion_date < now:
+        tat_status = "breached"
+    elif expected_completion_date - now < dt.timedelta(hours=24):
+        tat_status = "due_soon"
+    else:
+        tat_status = "on_time"
+
+    return {
+        "expected_completion_date": expected_completion_date,
+        "actual_completion_date": sample.actual_completion_date,
+        "committed_report_date": sample.committed_report_date,
+        "tat_status": tat_status,
+    }
+
+
+def overdue_samples():
+    """Samples with either an overdue open test order or a missed
+    committed report date — the "Overdue Sample Dashboard" the spec asks
+    for. Building blocks for reminders/escalation, not the notifications
+    themselves: this codebase has no scheduler (see mark_client_notified's
+    docstring for the same boundary on the sample-rejection side)."""
+    from apps.testing.models import TestOrder, TestOrderStatus
+
+    now = timezone.now()
+    overdue_order_sample_ids = TestOrder.objects.filter(
+        status__in=[TestOrderStatus.REQUESTED, TestOrderStatus.SCHEDULED, TestOrderStatus.IN_PROGRESS],
+        due_at__lt=now,
+    ).values_list("sample_id", flat=True)
+    committed_overdue_ids = Sample.objects.filter(
+        committed_report_date__lt=now, actual_completion_date__isnull=True
+    ).values_list("id", flat=True)
+    ids = set(overdue_order_sample_ids) | set(committed_overdue_ids)
+    return Sample.objects.filter(pk__in=ids).exclude(
+        state__in=[SampleState.DISPOSED, SampleState.REJECTED]
+    )
+
+
+def samples_due_for_disposal():
+    """Samples whose retention period has lapsed. Reporting only — actual
+    disposal still requires a human to call transition(..., DISPOSED),
+    signed and reasoned, never automatically."""
+    return Sample.objects.filter(retention_until__lte=timezone.now()).exclude(
+        state=SampleState.DISPOSED
+    )

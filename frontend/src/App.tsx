@@ -7,6 +7,8 @@ import SampleDetail from "./pages/SampleDetail";
 import BatchAccession from "./pages/BatchAccession";
 import LocationBrowser from "./pages/LocationBrowser";
 import Customers from "./pages/Customers";
+import ResultsQueue from "./pages/ResultsQueue";
+import Dashboard from "./pages/Dashboard";
 
 function RequireAuth({ children }: { children: ReactNode }) {
   const { me, loading } = useAuth();
@@ -25,6 +27,8 @@ function Layout({ children }: { children: ReactNode }) {
         <NavLink to="/accession">Batch accession</NavLink>
         <NavLink to="/storage">Storage</NavLink>
         <NavLink to="/customers">Customers</NavLink>
+        <NavLink to="/results">Results queue</NavLink>
+        <NavLink to="/dashboard">Dashboard</NavLink>
         <div className="spacer" />
         {me && (
           <>
@@ -60,6 +64,8 @@ export default function App() {
                 <Route path="/accession" element={<BatchAccession />} />
                 <Route path="/storage" element={<LocationBrowser />} />
                 <Route path="/customers" element={<Customers />} />
+                <Route path="/results" element={<ResultsQueue />} />
+                <Route path="/dashboard" element={<Dashboard />} />
                 <Route path="*" element={<Navigate to="/samples" replace />} />
               </Routes>
             </Layout>

@@ -93,7 +93,7 @@ class SampleAPITests(APITestCase):
         sample = make_sample(manager, barcode="BC-DISP-1", state=SampleState.IN_STORAGE)
         resp = self.client.post(
             f"/api/samples/{sample.pk}/transition/",
-            {"new_state": SampleState.DISPOSED, "reason_code": "STUDY_CLOSED"},
+            {"new_state": SampleState.DISPOSED, "reason_code": "STUDY_CLOSED", "password": "pw"},
             format="json",
         )
         self.assertEqual(resp.status_code, 200, resp.data)
@@ -175,7 +175,7 @@ class AcceptanceReviewAPITests(APITestCase):
 
         forbidden = self.client.post(
             f"/api/samples/{sample.pk}/reject/",
-            {"rejection_reason_code": "R005"},
+            {"rejection_reason_code": "R005", "password": "pw"},
             format="json",
         )
         self.assertEqual(forbidden.status_code, 403, forbidden.data)
@@ -183,7 +183,7 @@ class AcceptanceReviewAPITests(APITestCase):
         self.client.force_authenticate(user=self.qa)
         rejected = self.client.post(
             f"/api/samples/{sample.pk}/reject/",
-            {"rejection_reason_code": "R005"},
+            {"rejection_reason_code": "R005", "password": "pw"},
             format="json",
         )
         self.assertEqual(rejected.status_code, 200, rejected.data)
@@ -195,13 +195,15 @@ class AcceptanceReviewAPITests(APITestCase):
         sample = make_sample(self.analyst, barcode="BC-API-OTHER-1")
         self.client.force_authenticate(user=self.qa)
         resp = self.client.post(
-            f"/api/samples/{sample.pk}/reject/", {"rejection_reason_code": "OTHER"}, format="json"
+            f"/api/samples/{sample.pk}/reject/",
+            {"rejection_reason_code": "OTHER", "password": "pw"},
+            format="json",
         )
         self.assertEqual(resp.status_code, 400, resp.data)
 
         resp2 = self.client.post(
             f"/api/samples/{sample.pk}/reject/",
-            {"rejection_reason_code": "OTHER", "reason_text": "Sent to wrong lab."},
+            {"rejection_reason_code": "OTHER", "reason_text": "Sent to wrong lab.", "password": "pw"},
             format="json",
         )
         self.assertEqual(resp2.status_code, 200, resp2.data)
@@ -210,7 +212,9 @@ class AcceptanceReviewAPITests(APITestCase):
         sample = make_sample(self.analyst, barcode="BC-API-NOTIFY-1")
         self.client.force_authenticate(user=self.qa)
         self.client.post(
-            f"/api/samples/{sample.pk}/reject/", {"rejection_reason_code": "R002"}, format="json"
+            f"/api/samples/{sample.pk}/reject/",
+            {"rejection_reason_code": "R002", "password": "pw"},
+            format="json",
         )
         notify = self.client.post(f"/api/samples/{sample.pk}/notify-client/")
         self.assertEqual(notify.status_code, 200, notify.data)
@@ -252,3 +256,37 @@ class LocationAndMeAPITests(APITestCase):
         self.assertEqual(contents_resp.status_code, 200)
         self.assertEqual(len(contents_resp.data), 1)
         self.assertEqual(contents_resp.data[0]["barcode"], "BC-LOC-1")
+
+
+class TatAndRetentionAPITests(APITestCase):
+    def setUp(self):
+        self.user = make_user("tat_api", role="analyst")
+        self.client.force_authenticate(user=self.user)
+
+    def test_committed_report_date_and_sla_status(self):
+        sample = make_sample(self.user, barcode="BC-TAT-1")
+        resp = self.client.post(
+            f"/api/samples/{sample.pk}/set-committed-report-date/",
+            {"committed_report_date": "2020-01-01T00:00:00Z"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.data)
+
+        sla = self.client.get(f"/api/samples/{sample.pk}/sla-status/")
+        self.assertEqual(sla.status_code, 200)
+        self.assertEqual(sla.data["tat_status"], "breached")
+
+        overdue = self.client.get("/api/samples/overdue/")
+        self.assertIn(str(sample.pk), [s["id"] for s in overdue.data])
+
+    def test_retention(self):
+        sample = make_sample(self.user, barcode="BC-RET-1")
+        resp = self.client.post(
+            f"/api/samples/{sample.pk}/set-retention/",
+            {"retention_until": "2020-01-01T00:00:00Z"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.data)
+
+        due = self.client.get("/api/samples/due-for-disposal/")
+        self.assertIn(str(sample.pk), [s["id"] for s in due.data])

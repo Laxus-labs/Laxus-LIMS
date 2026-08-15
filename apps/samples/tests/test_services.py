@@ -164,7 +164,7 @@ class TransferTests(TestCase):
         manager = make_user("manager", role="lab_manager")
         services.transition(
             sample=self.sample, new_state=SampleState.DISPOSED, user=manager,
-            reason_code="STUDY_CLOSED",
+            reason_code="STUDY_CLOSED", password="pw",
         )
         with self.assertRaises(IllegalTransition):
             services.transfer(
@@ -299,7 +299,7 @@ class LifecycleTests(TestCase):
 
         services.transition(
             sample=self.sample, new_state=SampleState.DISPOSED, user=self.manager,
-            reason_code="STUDY_CLOSED", reason_text="Study MUM-114 closed out.",
+            reason_code="STUDY_CLOSED", reason_text="Study MUM-114 closed out.", password="pw",
         )
 
         self.assertEqual(
@@ -401,6 +401,7 @@ class AcceptanceReviewTests(TestCase):
             sample=sample,
             user=self.qa,
             rejection_reason_code="R001",
+            password="pw",
             checklist={"container_integrity_ok": False},
         )
         self.assertEqual(result.state, SampleState.REJECTED)
@@ -415,19 +416,20 @@ class AcceptanceReviewTests(TestCase):
     def test_rejected_sample_can_then_be_disposed(self):
         manager = make_user("manager2", role="lab_manager")
         sample = make_sample(self.analyst, barcode="BC-REJ-5", state=SampleState.RECEIVED)
-        services.reject_sample(sample=sample, user=self.qa, rejection_reason_code="R004")
+        services.reject_sample(sample=sample, user=self.qa, rejection_reason_code="R004", password="pw")
 
         disposed = services.transition(
             sample=sample,
             new_state=SampleState.DISPOSED,
             user=manager,
             reason_code="REJECTED_SAMPLE_DISPOSAL",
+            password="pw",
         )
         self.assertEqual(disposed.state, SampleState.DISPOSED)
 
     def test_mark_client_notified(self):
         sample = make_sample(self.analyst, barcode="BC-REJ-6", state=SampleState.RECEIVED)
-        services.reject_sample(sample=sample, user=self.qa, rejection_reason_code="R001")
+        services.reject_sample(sample=sample, user=self.qa, rejection_reason_code="R001", password="pw")
         self.assertIsNone(Sample.objects.get(pk=sample.pk).client_notified_at)
 
         notified = services.mark_client_notified(sample=sample, user=self.qa)

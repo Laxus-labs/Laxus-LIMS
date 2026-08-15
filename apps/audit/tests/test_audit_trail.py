@@ -54,7 +54,7 @@ class AuditCoverageTests(TestCase):
 
         services.transition(
             sample=sample, new_state=SampleState.DISPOSED, user=manager,
-            reason_code="STUDY_CLOSED", reason_text="Study MUM-114 closed out.",
+            reason_code="STUDY_CLOSED", reason_text="Study MUM-114 closed out.", password="pw",
         )
 
         event = AuditEvent.objects.filter(

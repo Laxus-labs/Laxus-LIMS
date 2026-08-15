@@ -1,6 +1,7 @@
 import type {
   AcceptanceChecklist,
   AccessionBatchResult,
+  CertificateOfAnalysis,
   Customer,
   Me,
   Paginated,
@@ -8,7 +9,13 @@ import type {
   Sample,
   SamplePlacement,
   SampleState,
+  SlaStatus,
+  Specification,
   StorageLocation,
+  TatSummary,
+  TestDefinition,
+  TestOrder,
+  TestResult,
 } from "./types";
 
 const BASE_URL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8000/api";
@@ -152,7 +159,12 @@ export const api = {
 
   rejectSample: (
     id: string,
-    payload: { rejection_reason_code: string; reason_text?: string; checklist?: AcceptanceChecklist }
+    payload: {
+      rejection_reason_code: string;
+      password: string;
+      reason_text?: string;
+      checklist?: AcceptanceChecklist;
+    }
   ) => apiFetch<Sample>(`/samples/${id}/reject/`, { method: "POST", body: payload }),
 
   notifyClient: (id: string) => apiFetch<Sample>(`/samples/${id}/notify-client/`, { method: "POST" }),
@@ -169,7 +181,7 @@ export const api = {
 
   transitionSample: (
     id: string,
-    payload: { new_state: SampleState; reason_code?: string; reason_text?: string }
+    payload: { new_state: SampleState; reason_code?: string; reason_text?: string; password?: string }
   ) => apiFetch<Sample>(`/samples/${id}/transition/`, { method: "POST", body: payload }),
 
   lineage: (id: string) => apiFetch<Sample[]>(`/samples/${id}/lineage/`),
@@ -205,4 +217,94 @@ export const api = {
 
   reactivateCustomer: (id: number, reason_text?: string) =>
     apiFetch<Customer>(`/customers/${id}/reactivate/`, { method: "POST", body: { reason_text } }),
+
+  // --- TAT / SLA / retention ---
+
+  slaStatus: (id: string) => apiFetch<SlaStatus>(`/samples/${id}/sla-status/`),
+
+  overdueSamples: () => apiFetch<Sample[]>("/samples/overdue/"),
+
+  samplesDueForDisposal: () => apiFetch<Sample[]>("/samples/due-for-disposal/"),
+
+  setCommittedReportDate: (id: string, committed_report_date: string) =>
+    apiFetch<Sample>(`/samples/${id}/set-committed-report-date/`, {
+      method: "POST",
+      body: { committed_report_date },
+    }),
+
+  setRetention: (id: string, retention_until: string) =>
+    apiFetch<Sample>(`/samples/${id}/set-retention/`, { method: "POST", body: { retention_until } }),
+
+  // --- testing ---
+
+  listTestDefinitions: () => apiFetch<TestDefinition[]>("/test-definitions/"),
+
+  listSpecifications: (test_definition?: number) =>
+    apiFetch<Specification[]>("/specifications/", { params: { test_definition } }),
+
+  listTestOrders: (params: { sample?: string; status?: string } = {}) =>
+    apiFetch<TestOrder[]>("/test-orders/", { params }),
+
+  placeOrder: (payload: {
+    sample_id: string;
+    test_definition_id: number;
+    priority?: number;
+    due_at?: string;
+    assigned_to_id?: number;
+    reason_code?: string;
+  }) => apiFetch<TestOrder>("/test-orders/", { method: "POST", body: payload }),
+
+  startOrder: (id: number) => apiFetch<TestOrder>(`/test-orders/${id}/start/`, { method: "POST" }),
+
+  cancelOrder: (id: number, reason_text: string) =>
+    apiFetch<TestOrder>(`/test-orders/${id}/cancel/`, { method: "POST", body: { reason_text } }),
+
+  enterResult: (
+    id: number,
+    payload: { numeric_value?: number | string; text_value?: string; instrument_ref?: string; comments?: string }
+  ) => apiFetch<TestResult>(`/test-orders/${id}/enter-result/`, { method: "POST", body: payload }),
+
+  overdueOrders: () => apiFetch<TestOrder[]>("/test-orders/overdue/"),
+
+  dueSoonOrders: (hours = 24) => apiFetch<TestOrder[]>("/test-orders/due-soon/", { params: { hours } }),
+
+  tatSummary: () => apiFetch<TatSummary>("/test-orders/tat-summary/"),
+
+  listTestResults: (params: { status?: string; is_out_of_spec?: string } = {}) =>
+    apiFetch<TestResult[]>("/test-results/", { params }),
+
+  submitResult: (id: number) => apiFetch<TestResult>(`/test-results/${id}/submit/`, { method: "POST" }),
+
+  reviewResult: (id: number, payload: { password: string; reason_text?: string }) =>
+    apiFetch<TestResult>(`/test-results/${id}/review/`, { method: "POST", body: payload }),
+
+  approveResult: (id: number, payload: { password: string; reason_text?: string }) =>
+    apiFetch<TestResult>(`/test-results/${id}/approve/`, { method: "POST", body: payload }),
+
+  rejectResult: (id: number, reason_text: string) =>
+    apiFetch<TestResult>(`/test-results/${id}/reject/`, { method: "POST", body: { reason_text } }),
+
+  closeOos: (id: number, payload: { password: string; resolution_text: string }) =>
+    apiFetch<TestResult>(`/test-results/${id}/close-oos/`, { method: "POST", body: payload }),
+
+  generateCoa: (sampleId: string) =>
+    apiFetch<CertificateOfAnalysis>(`/samples/${sampleId}/generate-coa/`, { method: "POST" }),
+
+  listCertificates: (sample?: string) =>
+    apiFetch<CertificateOfAnalysis[]>("/certificates/", { params: { sample } }),
+
+  releaseCoa: (id: number, payload: { password: string; reason_text?: string }) =>
+    apiFetch<CertificateOfAnalysis>(`/certificates/${id}/release/`, { method: "POST", body: payload }),
 };
+
+// The COA view returns HTML, not JSON, and needs the JWT header a plain
+// `<a href>` new-tab navigation can't supply (this API has no session
+// cookie). Fetch it authenticated and hand the caller a Blob URL to open
+// instead — see pages/SampleDetail.tsx's "View certificate" button.
+export async function fetchCoaHtml(id: number): Promise<string> {
+  const resp = await fetch(buildUrl(`/certificates/${id}/html/`), {
+    headers: accessToken ? { Authorization: `Bearer ${accessToken}` } : {},
+  });
+  if (!resp.ok) throw new ApiError(resp.status, await resp.text());
+  return resp.text();
+}

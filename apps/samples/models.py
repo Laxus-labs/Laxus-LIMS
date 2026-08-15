@@ -213,6 +213,27 @@ class Sample(models.Model):
         null=True, blank=True, help_text="Stability expiry, after which results are invalid."
     )
 
+    # --- turnaround time / retention ---------------------------------------
+    # What was promised to the customer at accessioning. "Expected
+    # completion" and "TAT status" are deliberately NOT stored columns —
+    # they are a function of the clock (services.sla_status computes them
+    # on read) and a stored value would silently go stale the moment time
+    # passed without a write, the same class of bug the ltree ADR warns
+    # about for derived data. committed_report_date is the one date a human
+    # actually decided, so it is the one that is a real column.
+    committed_report_date = models.DateTimeField(null=True, blank=True)
+    actual_completion_date = models.DateTimeField(
+        null=True, blank=True, help_text="Set when this sample's COA is released."
+    )
+    delay_reason = models.TextField(blank=True)
+
+    # How long the physical sample/record must be kept after completion,
+    # per the lab's retention policy for this sample type. Null means no
+    # policy has been applied yet; disposal still requires a human to act
+    # (see services.transition) — this only drives the "due for disposal"
+    # report, never an automatic disposal.
+    retention_until = models.DateTimeField(null=True, blank=True)
+
     # --- acceptance review -------------------------------------------------
     # The pre-testing gate: a checklist plus a decision, recorded once (or
     # again, if put ON_HOLD and revisited) before a sample may be

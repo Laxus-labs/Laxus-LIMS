@@ -1,13 +1,17 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { ApiError, api } from "../api/client";
+import { ApiError, api, fetchCoaHtml } from "../api/client";
 import {
   SAMPLE_STATES,
   type AcceptanceChecklist,
+  type CertificateOfAnalysis,
   type RejectionReasonCode,
   type Sample,
   type SamplePlacement,
+  type SlaStatus,
   type StorageLocation,
+  type TestDefinition,
+  type TestOrder,
 } from "../api/types";
 import { useAuth } from "../auth/AuthContext";
 
@@ -65,19 +69,42 @@ export default function SampleDetail() {
   const [holdReasonText, setHoldReasonText] = useState("");
   const [rejectReasonCode, setRejectReasonCode] = useState("");
   const [rejectReasonText, setRejectReasonText] = useState("");
+  const [rejectPassword, setRejectPassword] = useState("");
+  const [disposePassword, setDisposePassword] = useState("");
+
+  const [slaStatus, setSlaStatus] = useState<SlaStatus | null>(null);
+  const [committedReportDate, setCommittedReportDate] = useState("");
+  const [retentionUntil, setRetentionUntil] = useState("");
+
+  const [testDefinitions, setTestDefinitions] = useState<TestDefinition[]>([]);
+  const [testOrders, setTestOrders] = useState<TestOrder[]>([]);
+  const [certificates, setCertificates] = useState<CertificateOfAnalysis[]>([]);
+  const [orderTestDefId, setOrderTestDefId] = useState("");
+  const [resultValues, setResultValues] = useState<Record<number, string>>({});
 
   async function load() {
     if (!id) return;
-    const [s, lin, pl] = await Promise.all([api.getSample(id), api.lineage(id), api.placements(id)]);
+    const [s, lin, pl, sla, orders, certs] = await Promise.all([
+      api.getSample(id),
+      api.lineage(id),
+      api.placements(id),
+      api.slaStatus(id),
+      api.listTestOrders({ sample: id }),
+      api.listCertificates(id),
+    ]);
     setSample(s);
     setLineage(lin);
     setPlacements(pl);
+    setSlaStatus(sla);
+    setTestOrders(orders);
+    setCertificates(certs);
   }
 
   useEffect(() => {
     load();
     api.listLocations().then(setLocations);
     api.rejectionReasons().then(setRejectionReasons);
+    api.listTestDefinitions().then(setTestDefinitions);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
@@ -277,18 +304,25 @@ export default function SampleDetail() {
                     value={rejectReasonText}
                     onChange={(e) => setRejectReasonText(e.target.value)}
                   />
+                  <input
+                    type="password"
+                    placeholder="Your password (signs the rejection)"
+                    value={rejectPassword}
+                    onChange={(e) => setRejectPassword(e.target.value)}
+                  />
                   <button
                     className="secondary"
-                    disabled={busy || !rejectReasonCode || !me?.can_approve_qa}
+                    disabled={busy || !rejectReasonCode || !rejectPassword || !me?.can_approve_qa}
                     title={!me?.can_approve_qa ? "QA approval role required" : undefined}
                     onClick={() =>
                       runAction(() =>
                         api.rejectSample(sample.id, {
                           rejection_reason_code: rejectReasonCode,
                           reason_text: rejectReasonText,
+                          password: rejectPassword,
                           checklist,
                         })
-                      )
+                      ).then(() => setRejectPassword(""))
                     }
                   >
                     Reject
@@ -393,16 +427,25 @@ export default function SampleDetail() {
                 onChange={(e) => setReasonCode(e.target.value)}
               />
               <input placeholder="Reason text" value={reasonText} onChange={(e) => setReasonText(e.target.value)} />
+              {transitionState === "disposed" && (
+                <input
+                  type="password"
+                  placeholder="Your password (signs the disposal)"
+                  value={disposePassword}
+                  onChange={(e) => setDisposePassword(e.target.value)}
+                />
+              )}
               <button
-                disabled={busy || !transitionState}
+                disabled={busy || !transitionState || (transitionState === "disposed" && !disposePassword)}
                 onClick={() =>
                   runAction(() =>
                     api.transitionSample(sample.id, {
                       new_state: transitionState as Sample["state"],
                       reason_code: reasonCode,
                       reason_text: reasonText,
+                      password: disposePassword,
                     })
-                  )
+                  ).then(() => setDisposePassword(""))
                 }
               >
                 Apply
@@ -411,6 +454,195 @@ export default function SampleDetail() {
           </details>
         </section>
       </div>
+
+      <section className="card">
+        <h2>Turnaround &amp; retention</h2>
+        <dl>
+          <dt>TAT status</dt>
+          <dd>
+            {slaStatus && <span className={`badge tat-${slaStatus.tat_status}`}>{slaStatus.tat_status}</span>}
+          </dd>
+          <dt>Expected completion</dt>
+          <dd>{slaStatus?.expected_completion_date ? new Date(slaStatus.expected_completion_date).toLocaleString() : "—"}</dd>
+          <dt>Actual COA date</dt>
+          <dd>{slaStatus?.actual_completion_date ? new Date(slaStatus.actual_completion_date).toLocaleString() : "—"}</dd>
+          <dt>Retention until</dt>
+          <dd>{sample.retention_until ? new Date(sample.retention_until).toLocaleString() : "—"}</dd>
+        </dl>
+        <div className="inline-form">
+          <label>
+            Committed report date
+            <input
+              type="datetime-local"
+              value={committedReportDate}
+              onChange={(e) => setCommittedReportDate(e.target.value)}
+            />
+          </label>
+          <button
+            className="secondary"
+            disabled={busy || !committedReportDate}
+            onClick={() =>
+              runAction(() => api.setCommittedReportDate(sample.id, new Date(committedReportDate).toISOString()))
+            }
+          >
+            Set
+          </button>
+          <label>
+            Retention until
+            <input type="datetime-local" value={retentionUntil} onChange={(e) => setRetentionUntil(e.target.value)} />
+          </label>
+          <button
+            className="secondary"
+            disabled={busy || !retentionUntil}
+            onClick={() => runAction(() => api.setRetention(sample.id, new Date(retentionUntil).toISOString()))}
+          >
+            Set
+          </button>
+        </div>
+      </section>
+
+      <section className="card">
+        <h2>Testing</h2>
+        <div className="inline-form">
+          <select value={orderTestDefId} onChange={(e) => setOrderTestDefId(e.target.value)}>
+            <option value="">Choose a test…</option>
+            {testDefinitions.map((t) => (
+              <option key={t.id} value={t.id}>
+                {t.name} ({t.code})
+              </option>
+            ))}
+          </select>
+          <button
+            disabled={busy || !orderTestDefId}
+            onClick={() =>
+              runAction(() =>
+                api.placeOrder({ sample_id: sample.id, test_definition_id: Number(orderTestDefId) })
+              ).then(() => setOrderTestDefId(""))
+            }
+          >
+            Order test
+          </button>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Test</th>
+              <th>Status</th>
+              <th>Due</th>
+              <th>Result</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {testOrders.map((o) => (
+              <tr key={o.id}>
+                <td>{o.test_definition.name}</td>
+                <td>
+                  <span className={`badge state-${o.status}`}>{o.status}</span>
+                </td>
+                <td>{o.due_at ? new Date(o.due_at).toLocaleString() : "—"}</td>
+                <td>
+                  {o.has_result
+                    ? "recorded"
+                    : (o.status === "requested" || o.status === "scheduled" || o.status === "in_progress") && (
+                        <div className="inline-form">
+                          <input
+                            placeholder="Value"
+                            value={resultValues[o.id] ?? ""}
+                            onChange={(e) => setResultValues((prev) => ({ ...prev, [o.id]: e.target.value }))}
+                          />
+                          <button
+                            className="secondary"
+                            disabled={busy || !resultValues[o.id]}
+                            onClick={() =>
+                              runAction(() =>
+                                api.enterResult(o.id, { numeric_value: resultValues[o.id] })
+                              )
+                            }
+                          >
+                            Enter result
+                          </button>
+                        </div>
+                      )}
+                </td>
+                <td>
+                  {(o.status === "requested" || o.status === "scheduled") && (
+                    <button className="secondary" disabled={busy} onClick={() => runAction(() => api.startOrder(o.id))}>
+                      Start
+                    </button>
+                  )}
+                  {(o.status === "requested" || o.status === "scheduled" || o.status === "in_progress") && (
+                    <button
+                      className="secondary"
+                      disabled={busy}
+                      onClick={() => runAction(() => api.cancelOrder(o.id, "Cancelled from sample page."))}
+                    >
+                      Cancel
+                    </button>
+                  )}
+                </td>
+              </tr>
+            ))}
+            {testOrders.length === 0 && (
+              <tr>
+                <td colSpan={5}>No tests ordered yet.</td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </section>
+
+      <section className="card">
+        <h2>Certificates of analysis</h2>
+        <button
+          disabled={busy}
+          onClick={() => runAction(() => api.generateCoa(sample.id))}
+        >
+          Generate COA
+        </button>
+        <table>
+          <thead>
+            <tr>
+              <th>Number</th>
+              <th>Status</th>
+              <th>Generated</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            {certificates.map((c) => (
+              <tr key={c.id}>
+                <td>{c.coa_number || "(draft)"}</td>
+                <td>
+                  <span className={`badge state-${c.status}`}>{c.status}</span>
+                </td>
+                <td>{new Date(c.generated_at).toLocaleString()}</td>
+                <td>
+                  <button
+                    className="secondary"
+                    disabled={busy}
+                    onClick={async () => {
+                      const html = await fetchCoaHtml(c.id);
+                      const url = URL.createObjectURL(new Blob([html], { type: "text/html" }));
+                      window.open(url, "_blank");
+                    }}
+                  >
+                    View
+                  </button>
+                  {c.status === "draft" && me?.can_approve_results && (
+                    <ReleaseCoaButton coaId={c.id} busy={busy} onDone={load} onError={setError} />
+                  )}
+                </td>
+              </tr>
+            ))}
+            {certificates.length === 0 && (
+              <tr>
+                <td colSpan={4}>No certificates yet.</td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </section>
 
       <section className="card">
         <h2>Lineage</h2>
@@ -451,5 +683,49 @@ export default function SampleDetail() {
         </table>
       </section>
     </div>
+  );
+}
+
+function ReleaseCoaButton({
+  coaId,
+  busy,
+  onDone,
+  onError,
+}: {
+  coaId: number;
+  busy: boolean;
+  onDone: () => Promise<void>;
+  onError: (msg: string) => void;
+}) {
+  const [password, setPassword] = useState("");
+  const [releasing, setReleasing] = useState(false);
+
+  return (
+    <span className="inline-form">
+      <input
+        type="password"
+        placeholder="Password to release"
+        value={password}
+        onChange={(e) => setPassword(e.target.value)}
+      />
+      <button
+        className="secondary"
+        disabled={busy || releasing || !password}
+        onClick={async () => {
+          setReleasing(true);
+          try {
+            await api.releaseCoa(coaId, { password });
+            setPassword("");
+            await onDone();
+          } catch (err) {
+            onError(formatError(err));
+          } finally {
+            setReleasing(false);
+          }
+        }}
+      >
+        Release
+      </button>
+    </span>
   );
 }

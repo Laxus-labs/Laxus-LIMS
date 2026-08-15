@@ -3,15 +3,20 @@ from rest_framework.decorators import action
 from rest_framework.pagination import CursorPagination
 from rest_framework.response import Response
 
+from apps.testing import services as testing_services
+from apps.testing.serializers import CertificateOfAnalysisSerializer
+
 from . import services
 from .models import RejectionReasonCode, Sample
 from .serializers import (
     AcceptInputSerializer,
     AccessionBatchInputSerializer,
     AliquotInputSerializer,
+    CommittedReportDateInputSerializer,
     HoldInputSerializer,
     RejectInputSerializer,
     RejectionReasonCodeSerializer,
+    RetentionInputSerializer,
     SamplePlacementSerializer,
     SampleSerializer,
     TransferInputSerializer,
@@ -112,6 +117,7 @@ class SampleViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.G
         sample = services.reject_sample(
             sample=self.get_object(),
             user=request.user,
+            password=data["password"],
             rejection_reason_code=data["rejection_reason_code"],
             reason_text=data["reason_text"],
             checklist=data["checklist"],
@@ -170,6 +176,7 @@ class SampleViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.G
             user=request.user,
             reason_code=data["reason_code"],
             reason_text=data["reason_text"],
+            password=data["password"],
         )
         return Response(SampleSerializer(sample).data)
 
@@ -198,3 +205,42 @@ class SampleViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.G
         days = int(request.query_params.get("days", 30))
         qs = services.expiring_within(days)
         return Response(SampleSerializer(qs, many=True).data)
+
+    @action(detail=True, methods=["get"], url_path="sla-status")
+    def sla_status(self, request, pk=None):
+        return Response(services.sla_status(self.get_object()))
+
+    @action(detail=False, methods=["get"], url_path="overdue")
+    def overdue(self, request):
+        """Unpaginated for the same reason as `expiring` — this is the
+        Overdue Sample Dashboard, a bounded operational list."""
+        qs = services.overdue_samples()
+        return Response(SampleSerializer(qs, many=True).data)
+
+    @action(detail=False, methods=["get"], url_path="due-for-disposal")
+    def due_for_disposal(self, request):
+        qs = services.samples_due_for_disposal()
+        return Response(SampleSerializer(qs, many=True).data)
+
+    @action(detail=True, methods=["post"], url_path="set-committed-report-date")
+    def set_committed_report_date(self, request, pk=None):
+        serializer = CommittedReportDateInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        sample = self.get_object()
+        sample.committed_report_date = serializer.validated_data["committed_report_date"]
+        sample.save(update_fields=["committed_report_date", "updated_at"])
+        return Response(SampleSerializer(sample).data)
+
+    @action(detail=True, methods=["post"], url_path="set-retention")
+    def set_retention(self, request, pk=None):
+        serializer = RetentionInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        sample = self.get_object()
+        sample.retention_until = serializer.validated_data["retention_until"]
+        sample.save(update_fields=["retention_until", "updated_at"])
+        return Response(SampleSerializer(sample).data)
+
+    @action(detail=True, methods=["post"], url_path="generate-coa")
+    def generate_coa(self, request, pk=None):
+        coa = testing_services.generate_coa(sample=self.get_object(), user=request.user)
+        return Response(CertificateOfAnalysisSerializer(coa).data, status=201)

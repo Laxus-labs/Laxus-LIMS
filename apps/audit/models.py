@@ -131,6 +131,8 @@ class ElectronicSignature(models.Model):
         APPROVED = "approved", "Approved by"
         REJECTED = "rejected", "Rejected by"
         DISPOSED = "disposed", "Disposal authorised by"
+        COA_RELEASED = "coa_released", "COA released by"
+        OOS_CLOSED = "oos_closed", "OOS closure authorised by"
 
     signer = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT)
     signer_username = models.CharField(max_length=150)

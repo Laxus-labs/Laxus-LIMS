@@ -102,6 +102,10 @@ class SampleSerializer(serializers.ModelSerializer):
             "qa_approved_by",
             "qa_approved_at",
             "client_notified_at",
+            "committed_report_date",
+            "actual_completion_date",
+            "delay_reason",
+            "retention_until",
             "metadata",
             "created_by",
             "created_at",
@@ -186,6 +190,15 @@ class RejectInputSerializer(serializers.Serializer):
     rejection_reason_code = serializers.CharField(max_length=16)
     reason_text = serializers.CharField(required=False, allow_blank=True, default="")
     checklist = AcceptanceChecklistInputSerializer(required=False, default=dict)
+    password = serializers.CharField(write_only=True)
+
+
+class CommittedReportDateInputSerializer(serializers.Serializer):
+    committed_report_date = serializers.DateTimeField()
+
+
+class RetentionInputSerializer(serializers.Serializer):
+    retention_until = serializers.DateTimeField()
 
 
 class TransferInputSerializer(serializers.Serializer):
@@ -213,3 +226,6 @@ class TransitionInputSerializer(serializers.Serializer):
     new_state = serializers.ChoiceField(choices=SampleState.choices)
     reason_code = serializers.CharField(max_length=64, required=False, allow_blank=True, default="")
     reason_text = serializers.CharField(required=False, allow_blank=True, default="")
+    # Only actually required when new_state is DISPOSED — validated in the
+    # service layer, since whether it's required depends on another field.
+    password = serializers.CharField(required=False, allow_blank=True, default="", write_only=True)
