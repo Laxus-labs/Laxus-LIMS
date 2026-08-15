@@ -1,8 +1,24 @@
 import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { ApiError, api } from "../api/client";
-import { SAMPLE_STATES, type Sample, type SamplePlacement, type StorageLocation } from "../api/types";
+import {
+  SAMPLE_STATES,
+  type AcceptanceChecklist,
+  type RejectionReasonCode,
+  type Sample,
+  type SamplePlacement,
+  type StorageLocation,
+} from "../api/types";
 import { useAuth } from "../auth/AuthContext";
+
+const CHECKLIST_ITEMS: { key: keyof AcceptanceChecklist; label: string }[] = [
+  { key: "container_integrity_ok", label: "Container integrity" },
+  { key: "seal_integrity_ok", label: "Seal integrity" },
+  { key: "quantity_ok", label: "Quantity" },
+  { key: "label_ok", label: "Label" },
+  { key: "documentation_ok", label: "Documentation" },
+  { key: "transport_conditions_ok", label: "Transport/storage conditions" },
+];
 
 function formatError(err: unknown): string {
   if (err instanceof ApiError) {
@@ -41,6 +57,15 @@ export default function SampleDetail() {
   const [reasonCode, setReasonCode] = useState("");
   const [reasonText, setReasonText] = useState("");
 
+  const [rejectionReasons, setRejectionReasons] = useState<RejectionReasonCode[]>([]);
+  const [checklist, setChecklist] = useState<AcceptanceChecklist>({});
+  const [withDeviation, setWithDeviation] = useState(false);
+  const [deviationNotes, setDeviationNotes] = useState("");
+  const [holdReasonCode, setHoldReasonCode] = useState("");
+  const [holdReasonText, setHoldReasonText] = useState("");
+  const [rejectReasonCode, setRejectReasonCode] = useState("");
+  const [rejectReasonText, setRejectReasonText] = useState("");
+
   async function load() {
     if (!id) return;
     const [s, lin, pl] = await Promise.all([api.getSample(id), api.lineage(id), api.placements(id)]);
@@ -52,6 +77,7 @@ export default function SampleDetail() {
   useEffect(() => {
     load();
     api.listLocations().then(setLocations);
+    api.rejectionReasons().then(setRejectionReasons);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
@@ -96,12 +122,45 @@ export default function SampleDetail() {
             </dd>
             <dt>Subject ref</dt>
             <dd>{sample.subject_ref || "—"}</dd>
+            <dt>Customer</dt>
+            <dd>{sample.customer ? `${sample.customer.name} (${sample.customer.code})` : "—"}</dd>
             <dt>Current location</dt>
             <dd>
               {sample.current_placement
                 ? `${sample.current_placement.location.name} ${sample.current_placement.row_label}${sample.current_placement.column_number ?? ""}`
                 : "Not placed"}
             </dd>
+            <dt>Acceptance decision</dt>
+            <dd>
+              {sample.acceptance_decision}
+              {sample.acceptance_decision === "accepted_with_deviation" &&
+                sample.deviation_notes &&
+                ` — ${sample.deviation_notes}`}
+            </dd>
+            {sample.state === "rejected" && (
+              <>
+                <dt>Rejection reason</dt>
+                <dd>
+                  {sample.rejection_reason ? `${sample.rejection_reason.code} — ${sample.rejection_reason.label}` : "—"}
+                  {sample.rejection_reason_other && ` (${sample.rejection_reason_other})`}
+                </dd>
+                <dt>QA approved by</dt>
+                <dd>{sample.qa_approved_by ?? "—"}</dd>
+                <dt>Client notified</dt>
+                <dd>
+                  {sample.client_notified_at ? new Date(sample.client_notified_at).toLocaleString() : "Not yet"}
+                  {!sample.client_notified_at && (
+                    <button
+                      className="secondary"
+                      disabled={busy}
+                      onClick={() => runAction(() => api.notifyClient(sample.id))}
+                    >
+                      Mark notified
+                    </button>
+                  )}
+                </dd>
+              </>
+            )}
             <dt>Created by</dt>
             <dd>{sample.created_by}</dd>
             {sample.parent && (
@@ -118,10 +177,126 @@ export default function SampleDetail() {
         <section className="card">
           <h2>Actions</h2>
 
-          {sample.state === "received" && (
-            <button disabled={busy} onClick={() => runAction(() => api.accessionSample(sample.id))}>
-              Accession
-            </button>
+          {(sample.state === "received" || sample.state === "on_hold") && (
+            <details open>
+              <summary>Acceptance review</summary>
+              <div className="inline-form" style={{ flexDirection: "column", alignItems: "flex-start" }}>
+                {CHECKLIST_ITEMS.map(({ key, label }) => (
+                  <label key={key}>
+                    {label}:{" "}
+                    <select
+                      value={checklist[key] === undefined ? "" : String(checklist[key])}
+                      onChange={(e) => {
+                        const v = e.target.value;
+                        setChecklist((prev) => {
+                          const next = { ...prev };
+                          if (v === "") delete next[key];
+                          else next[key] = v === "true";
+                          return next;
+                        });
+                      }}
+                    >
+                      <option value="">Not checked</option>
+                      <option value="true">Pass</option>
+                      <option value="false">Fail</option>
+                    </select>
+                  </label>
+                ))}
+
+                <div>
+                  <label>
+                    <input type="checkbox" checked={withDeviation} onChange={(e) => setWithDeviation(e.target.checked)} />
+                    Accept with deviation
+                  </label>
+                  {withDeviation && (
+                    <input
+                      placeholder="Deviation notes (required)"
+                      value={deviationNotes}
+                      onChange={(e) => setDeviationNotes(e.target.value)}
+                    />
+                  )}
+                  <button
+                    disabled={busy}
+                    onClick={() =>
+                      runAction(() =>
+                        api.acceptSample(sample.id, {
+                          with_deviation: withDeviation,
+                          deviation_notes: deviationNotes,
+                          checklist,
+                        })
+                      )
+                    }
+                  >
+                    Accept
+                  </button>
+                </div>
+
+                <div>
+                  <input
+                    placeholder="Hold reason code"
+                    value={holdReasonCode}
+                    onChange={(e) => setHoldReasonCode(e.target.value)}
+                  />
+                  <input
+                    placeholder="Hold reason text"
+                    value={holdReasonText}
+                    onChange={(e) => setHoldReasonText(e.target.value)}
+                  />
+                  <button
+                    className="secondary"
+                    disabled={busy || !holdReasonCode || sample.state === "on_hold"}
+                    onClick={() =>
+                      runAction(() =>
+                        api.holdSample(sample.id, {
+                          reason_code: holdReasonCode,
+                          reason_text: holdReasonText,
+                          checklist,
+                        })
+                      )
+                    }
+                  >
+                    Put on hold
+                  </button>
+                </div>
+
+                <div>
+                  <select value={rejectReasonCode} onChange={(e) => setRejectReasonCode(e.target.value)}>
+                    <option value="">Choose a rejection reason…</option>
+                    {rejectionReasons.map((r) => (
+                      <option key={r.code} value={r.code}>
+                        {r.code} — {r.label}
+                      </option>
+                    ))}
+                  </select>
+                  <input
+                    placeholder={
+                      rejectionReasons.find((r) => r.code === rejectReasonCode)?.requires_details
+                        ? "Details (required)"
+                        : "Details (optional)"
+                    }
+                    value={rejectReasonText}
+                    onChange={(e) => setRejectReasonText(e.target.value)}
+                  />
+                  <button
+                    className="secondary"
+                    disabled={busy || !rejectReasonCode || !me?.can_approve_qa}
+                    title={!me?.can_approve_qa ? "QA approval role required" : undefined}
+                    onClick={() =>
+                      runAction(() =>
+                        api.rejectSample(sample.id, {
+                          rejection_reason_code: rejectReasonCode,
+                          reason_text: rejectReasonText,
+                          checklist,
+                        })
+                      )
+                    }
+                  >
+                    Reject
+                  </button>
+                  {!me?.can_approve_qa && <p className="muted">Rejection requires a QA-approval role.</p>}
+                </div>
+              </div>
+            </details>
           )}
 
           <details>
@@ -198,7 +373,15 @@ export default function SampleDetail() {
             <div className="inline-form">
               <select value={transitionState} onChange={(e) => setTransitionState(e.target.value)}>
                 <option value="">Choose a state…</option>
-                {SAMPLE_STATES.filter((s) => s !== "disposed" || me?.can_dispose_samples).map((s) => (
+                {SAMPLE_STATES.filter(
+                  (s) =>
+                    // received/on_hold/accessioned/rejected go through the
+                    // Acceptance review panel above, which also satisfies
+                    // the DB-enforced reason/QA-approval requirements a
+                    // plain transition() to "rejected" would fail on.
+                    !["received", "on_hold", "accessioned", "rejected"].includes(s) &&
+                    (s !== "disposed" || me?.can_dispose_samples)
+                ).map((s) => (
                   <option key={s} value={s}>
                     {s}
                   </option>

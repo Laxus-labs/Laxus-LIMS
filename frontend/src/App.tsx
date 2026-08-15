@@ -6,6 +6,7 @@ import SampleList from "./pages/SampleList";
 import SampleDetail from "./pages/SampleDetail";
 import BatchAccession from "./pages/BatchAccession";
 import LocationBrowser from "./pages/LocationBrowser";
+import Customers from "./pages/Customers";
 
 function RequireAuth({ children }: { children: ReactNode }) {
   const { me, loading } = useAuth();
@@ -23,6 +24,7 @@ function Layout({ children }: { children: ReactNode }) {
         <NavLink to="/samples">Samples</NavLink>
         <NavLink to="/accession">Batch accession</NavLink>
         <NavLink to="/storage">Storage</NavLink>
+        <NavLink to="/customers">Customers</NavLink>
         <div className="spacer" />
         {me && (
           <>
@@ -57,6 +59,7 @@ export default function App() {
                 <Route path="/samples/:id" element={<SampleDetail />} />
                 <Route path="/accession" element={<BatchAccession />} />
                 <Route path="/storage" element={<LocationBrowser />} />
+                <Route path="/customers" element={<Customers />} />
                 <Route path="*" element={<Navigate to="/samples" replace />} />
               </Routes>
             </Layout>

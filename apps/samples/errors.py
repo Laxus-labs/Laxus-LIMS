@@ -33,3 +33,8 @@ class PermissionDenied(SampleError):
 
 class ReasonRequired(SampleError):
     """A regulated action was attempted without a reason code."""
+
+
+class RejectionReasonRequired(SampleError):
+    """A rejection was attempted without a rejection reason code, or with
+    a code that requires details (e.g. 'Other') but no details given."""

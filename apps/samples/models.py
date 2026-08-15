@@ -27,6 +27,7 @@ from django.db import models
 
 class SampleState(models.TextChoices):
     RECEIVED = "received", "Received"
+    ON_HOLD = "on_hold", "On hold"
     ACCESSIONED = "accessioned", "Accessioned"
     IN_STORAGE = "in_storage", "In storage"
     IN_TESTING = "in_testing", "In testing"
@@ -41,8 +42,18 @@ class SampleState(models.TextChoices):
 # Note that ALIQUOTED is not terminal: taking an aliquot from a sample does
 # not consume it, so the parent returns to storage or testing while its
 # children live their own lives. EXHAUSTED means volume actually hit zero.
+#
+# ON_HOLD sits between RECEIVED and ACCESSIONED for the acceptance-review
+# gate (see services.accept_sample/put_on_hold/reject_sample): a sample
+# whose checklist raised a question is parked here rather than forced into
+# either a pass or a fail while it is being chased down.
 ALLOWED_TRANSITIONS: dict[str, set[str]] = {
-    SampleState.RECEIVED: {SampleState.ACCESSIONED, SampleState.REJECTED},
+    SampleState.RECEIVED: {
+        SampleState.ACCESSIONED,
+        SampleState.ON_HOLD,
+        SampleState.REJECTED,
+    },
+    SampleState.ON_HOLD: {SampleState.ACCESSIONED, SampleState.REJECTED},
     SampleState.ACCESSIONED: {
         SampleState.IN_STORAGE,
         SampleState.IN_TESTING,
@@ -94,6 +105,48 @@ class VolumeUnit(models.TextChoices):
     COUNT = "count", "count"
 
 
+class AcceptanceDecision(models.TextChoices):
+    """
+    The outcome of the pre-testing acceptance review — a narrower question
+    than `state`. A sample can be ACCESSIONED (state) while its acceptance
+    decision recorded ACCEPTED_WITH_DEVIATION, which is information a
+    reviewer needs and a bare state string would lose.
+    """
+
+    PENDING = "pending", "Pending"
+    ACCEPTED = "accepted", "Accepted"
+    ACCEPTED_WITH_DEVIATION = "accepted_with_deviation", "Accepted with deviation"
+    ON_HOLD = "on_hold", "On hold"
+    REJECTED = "rejected", "Rejected"
+
+
+class RejectionReasonCode(models.Model):
+    """
+    The lab's fixed list of rejection reasons (R001-R012, plus a catch-all
+    "Other"). A lookup table rather than a `TextChoices` because it is
+    referenced by FK from `Sample.rejection_reason` — that FK, not a free
+    -text field, is what lets `sample_rejected_requires_reason` below be a
+    real database constraint instead of a service-layer-only check.
+    """
+
+    code = models.CharField(max_length=16, primary_key=True)
+    label = models.CharField(max_length=200)
+    # "Other" (and any future catch-all) forces reason_text/
+    # rejection_reason_other to be filled in — enforced in
+    # services.reject_sample, since a cross-row rule like this needs a
+    # trigger to enforce in the database and isn't worth one here.
+    requires_details = models.BooleanField(default=False)
+    is_active = models.BooleanField(default=True)
+    sort_order = models.PositiveSmallIntegerField(default=0)
+
+    class Meta:
+        db_table = "rejection_reason_code"
+        ordering = ["sort_order", "code"]
+
+    def __str__(self) -> str:
+        return f"{self.code} — {self.label}"
+
+
 class Sample(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
 
@@ -107,6 +160,18 @@ class Sample(models.Model):
     sample_type = models.CharField(max_length=20, choices=SampleType.choices)
     state = models.CharField(
         max_length=20, choices=SampleState.choices, default=SampleState.RECEIVED
+    )
+
+    # The client this sample was submitted on behalf of. Nullable because
+    # historical samples predate this field and internal/QC samples may
+    # have no external customer at all; PROTECT because a customer with
+    # samples on file must be deactivated, never deleted out from under them.
+    customer = models.ForeignKey(
+        "customers.Customer",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="samples",
     )
 
     # --- lineage ---------------------------------------------------------
@@ -148,6 +213,41 @@ class Sample(models.Model):
         null=True, blank=True, help_text="Stability expiry, after which results are invalid."
     )
 
+    # --- acceptance review -------------------------------------------------
+    # The pre-testing gate: a checklist plus a decision, recorded once (or
+    # again, if put ON_HOLD and revisited) before a sample may be
+    # accessioned. See services.accept_sample / put_on_hold / reject_sample.
+    acceptance_decision = models.CharField(
+        max_length=30, choices=AcceptanceDecision.choices, default=AcceptanceDecision.PENDING
+    )
+    deviation_notes = models.TextField(blank=True)
+
+    container_integrity_ok = models.BooleanField(null=True, blank=True)
+    seal_integrity_ok = models.BooleanField(null=True, blank=True)
+    quantity_ok = models.BooleanField(null=True, blank=True)
+    label_ok = models.BooleanField(null=True, blank=True)
+    documentation_ok = models.BooleanField(null=True, blank=True)
+    transport_conditions_ok = models.BooleanField(null=True, blank=True)
+
+    rejection_reason = models.ForeignKey(
+        RejectionReasonCode, null=True, blank=True, on_delete=models.PROTECT, related_name="samples"
+    )
+    rejection_reason_other = models.TextField(blank=True)
+
+    # Rejection requires sign-off from a QA-capable role (see
+    # accounts.User.can_approve_qa) — recorded here, not just in the audit
+    # trail, so "was this QA-approved" is a column read rather than a query
+    # over audit_event. Enforced by sample_rejected_requires_qa_approval.
+    qa_approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="qa_approved_samples",
+    )
+    qa_approved_at = models.DateTimeField(null=True, blank=True)
+    client_notified_at = models.DateTimeField(null=True, blank=True)
+
     # Assay-specific fields vary per lab and per study; a JSONB column keeps
     # that flexibility without a migration per customer. Anything queried
     # often enough to need an index gets promoted to a real column.
@@ -176,6 +276,21 @@ class Sample(models.Model):
                     | models.Q(generation__gt=0, parent__isnull=False)
                 ),
                 name="sample_generation_matches_parentage",
+            ),
+            # "Mandatory rejection reason codes" and "QA approval required
+            # for rejection" from the spec, held as real invariants rather
+            # than trusted to services.reject_sample alone (see ADR #1) —
+            # a rejected sample with no reason or no QA sign-off cannot
+            # exist, full stop, regardless of which code path wrote it.
+            models.CheckConstraint(
+                condition=~models.Q(state=SampleState.REJECTED)
+                | models.Q(rejection_reason__isnull=False),
+                name="sample_rejected_requires_reason",
+            ),
+            models.CheckConstraint(
+                condition=~models.Q(state=SampleState.REJECTED)
+                | models.Q(qa_approved_by__isnull=False),
+                name="sample_rejected_requires_qa_approval",
             ),
         ]
         indexes = [

@@ -1,21 +1,31 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { ApiError, api } from "../api/client";
-import { SAMPLE_TYPES, type AccessionBatchResult } from "../api/types";
+import { SAMPLE_TYPES, type AccessionBatchResult, type Customer } from "../api/types";
 
 export default function BatchAccession() {
   const [barcodes, setBarcodes] = useState("");
   const [sampleType, setSampleType] = useState<(typeof SAMPLE_TYPES)[number]>("serum");
+  const [customers, setCustomers] = useState<Customer[]>([]);
+  const [customerId, setCustomerId] = useState("");
   const [result, setResult] = useState<AccessionBatchResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => {
+    api.listCustomers({}).then((page) => setCustomers(page.results));
+  }, []);
 
   async function submit() {
     const scans = barcodes
       .split(/[\s,]+/)
       .map((b) => b.trim())
       .filter(Boolean)
-      .map((barcode) => ({ barcode, sample_type: sampleType }));
+      .map((barcode) => ({
+        barcode,
+        sample_type: sampleType,
+        customer_id: customerId ? Number(customerId) : undefined,
+      }));
 
     if (scans.length === 0) return;
 
@@ -44,6 +54,17 @@ export default function BatchAccession() {
             {SAMPLE_TYPES.map((t) => (
               <option key={t} value={t}>
                 {t}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Customer for this batch (optional)
+          <select value={customerId} onChange={(e) => setCustomerId(e.target.value)}>
+            <option value="">No customer</option>
+            {customers.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.name} ({c.code})
               </option>
             ))}
           </select>

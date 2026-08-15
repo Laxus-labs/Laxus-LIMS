@@ -3,10 +3,15 @@ from decimal import Decimal
 from django.contrib.auth import get_user_model
 from django.utils import timezone
 
+from apps.customers.models import Customer
 from apps.samples.models import Sample, SampleState, SampleType
 from apps.storage.models import LocationType, StorageLocation
 
 User = get_user_model()
+
+
+def make_customer(user, code="CUST-1", name="Acme Pharma"):
+    return Customer.objects.create(code=code, name=name, created_by=user)
 
 
 def make_user(username="tech", role="analyst"):

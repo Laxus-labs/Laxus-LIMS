@@ -57,6 +57,12 @@ class User(AbstractUser):
         return self.role in {Role.LAB_MANAGER, Role.QA_APPROVER, Role.ADMIN}
 
     @property
+    def can_approve_qa(self) -> bool:
+        """Gates sample rejection (see apps.samples.services.reject_sample)
+        and is who gets recorded as `Sample.qa_approved_by`."""
+        return self.role in {Role.QA_APPROVER, Role.LAB_MANAGER, Role.ADMIN}
+
+    @property
     def can_adjust_inventory(self) -> bool:
         """Manual stock adjustments bypass the normal reserve/consume flow,
         so they are restricted and always require a reason code."""

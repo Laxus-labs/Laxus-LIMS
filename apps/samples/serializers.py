@@ -14,9 +14,22 @@ from decimal import Decimal
 
 from rest_framework import serializers
 
+from apps.customers.models import Customer
 from apps.storage.models import StorageLocation
 
-from .models import Sample, SamplePlacement, SampleState, SampleType, VolumeUnit
+from .models import RejectionReasonCode, Sample, SamplePlacement, SampleState, SampleType, VolumeUnit
+
+
+class CustomerMiniSerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    name = serializers.CharField()
+    code = serializers.CharField()
+
+
+class RejectionReasonCodeSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = RejectionReasonCode
+        fields = ["code", "label", "requires_details"]
 
 
 class LocationMiniSerializer(serializers.Serializer):
@@ -51,6 +64,9 @@ class SamplePlacementSerializer(serializers.ModelSerializer):
 
 class SampleSerializer(serializers.ModelSerializer):
     created_by = serializers.SlugRelatedField(slug_field="username", read_only=True)
+    qa_approved_by = serializers.SlugRelatedField(slug_field="username", read_only=True)
+    customer = CustomerMiniSerializer(read_only=True)
+    rejection_reason = RejectionReasonCodeSerializer(read_only=True)
     current_placement = serializers.SerializerMethodField()
 
     class Meta:
@@ -61,6 +77,7 @@ class SampleSerializer(serializers.ModelSerializer):
             "accession_number",
             "sample_type",
             "state",
+            "customer",
             "parent",
             "root",
             "generation",
@@ -72,6 +89,19 @@ class SampleSerializer(serializers.ModelSerializer):
             "accessioned_at",
             "disposed_at",
             "expires_at",
+            "acceptance_decision",
+            "deviation_notes",
+            "container_integrity_ok",
+            "seal_integrity_ok",
+            "quantity_ok",
+            "label_ok",
+            "documentation_ok",
+            "transport_conditions_ok",
+            "rejection_reason",
+            "rejection_reason_other",
+            "qa_approved_by",
+            "qa_approved_at",
+            "client_notified_at",
             "metadata",
             "created_by",
             "created_at",
@@ -95,6 +125,9 @@ class ScanInputSerializer(serializers.Serializer):
 
     barcode = serializers.CharField(max_length=64)
     sample_type = serializers.ChoiceField(choices=SampleType.choices)
+    customer_id = serializers.PrimaryKeyRelatedField(
+        source="customer", queryset=Customer.objects.all(), required=False, allow_null=True, default=None
+    )
     volume = serializers.DecimalField(
         max_digits=12, decimal_places=4, required=False, default=0
     )
@@ -115,6 +148,44 @@ class AccessionBatchInputSerializer(serializers.Serializer):
     reason_code = serializers.CharField(
         max_length=64, required=False, default="BATCH_ACCESSION"
     )
+
+
+class AcceptanceChecklistInputSerializer(serializers.Serializer):
+    """Every field optional — a caller may record only what they actually
+    checked, and re-checking is fine (accept/hold/reject all accept this)."""
+
+    container_integrity_ok = serializers.BooleanField(required=False, allow_null=True, default=None)
+    seal_integrity_ok = serializers.BooleanField(required=False, allow_null=True, default=None)
+    quantity_ok = serializers.BooleanField(required=False, allow_null=True, default=None)
+    label_ok = serializers.BooleanField(required=False, allow_null=True, default=None)
+    documentation_ok = serializers.BooleanField(required=False, allow_null=True, default=None)
+    transport_conditions_ok = serializers.BooleanField(required=False, allow_null=True, default=None)
+
+    def to_internal_value(self, data):
+        validated = super().to_internal_value(data)
+        # Only pass along keys the caller actually sent, so an omitted
+        # field doesn't overwrite a previously-recorded check with None.
+        return {key: validated[key] for key in data if key in validated}
+
+
+class AcceptInputSerializer(serializers.Serializer):
+    with_deviation = serializers.BooleanField(required=False, default=False)
+    deviation_notes = serializers.CharField(required=False, allow_blank=True, default="")
+    checklist = AcceptanceChecklistInputSerializer(required=False, default=dict)
+    reason_code = serializers.CharField(max_length=64, required=False, default="ACCEPTANCE")
+    reason_text = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class HoldInputSerializer(serializers.Serializer):
+    reason_code = serializers.CharField(max_length=64)
+    reason_text = serializers.CharField(required=False, allow_blank=True, default="")
+    checklist = AcceptanceChecklistInputSerializer(required=False, default=dict)
+
+
+class RejectInputSerializer(serializers.Serializer):
+    rejection_reason_code = serializers.CharField(max_length=16)
+    reason_text = serializers.CharField(required=False, allow_blank=True, default="")
+    checklist = AcceptanceChecklistInputSerializer(required=False, default=dict)
 
 
 class TransferInputSerializer(serializers.Serializer):

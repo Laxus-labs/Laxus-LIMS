@@ -13,10 +13,17 @@ from apps.samples.errors import (
     PermissionDenied,
     PositionOccupied,
     ReasonRequired,
+    RejectionReasonRequired,
 )
-from apps.samples.models import ALLOWED_TRANSITIONS, Sample, SamplePlacement, SampleState
+from apps.samples.models import (
+    ALLOWED_TRANSITIONS,
+    AcceptanceDecision,
+    Sample,
+    SamplePlacement,
+    SampleState,
+)
 
-from .factories import make_hierarchy, make_sample, make_user
+from .factories import make_customer, make_hierarchy, make_sample, make_user
 
 
 class BatchAccessioningTests(TestCase):
@@ -317,6 +324,114 @@ class LifecycleTests(TestCase):
             for dst in targets
         }
         self.assertEqual(in_python, in_db)
+
+
+class AcceptanceReviewTests(TestCase):
+    def setUp(self):
+        self.analyst = make_user("frontdesk", role="analyst")
+        self.qa = make_user("qa1", role="qa_approver")
+        self.customer = make_customer(self.analyst)
+
+    def test_accept_advances_to_accessioned_and_records_checklist(self):
+        sample = make_sample(
+            self.analyst, barcode="BC-ACPT-1", state=SampleState.RECEIVED, customer=self.customer
+        )
+        result = services.accept_sample(
+            sample=sample,
+            user=self.analyst,
+            checklist={"container_integrity_ok": True, "label_ok": True},
+        )
+        self.assertEqual(result.state, SampleState.ACCESSIONED)
+        self.assertEqual(result.acceptance_decision, AcceptanceDecision.ACCEPTED)
+        self.assertTrue(result.container_integrity_ok)
+        self.assertTrue(result.label_ok)
+        self.assertIsNone(result.seal_integrity_ok)
+        self.assertIsNotNone(result.accession_number)
+
+    def test_accept_with_deviation_requires_notes(self):
+        sample = make_sample(self.analyst, barcode="BC-DEV-1", state=SampleState.RECEIVED)
+        with self.assertRaises(ReasonRequired):
+            services.accept_sample(sample=sample, user=self.analyst, with_deviation=True)
+
+        result = services.accept_sample(
+            sample=sample, user=self.analyst, with_deviation=True, deviation_notes="Cap loose."
+        )
+        self.assertEqual(result.acceptance_decision, AcceptanceDecision.ACCEPTED_WITH_DEVIATION)
+        self.assertEqual(result.deviation_notes, "Cap loose.")
+
+    def test_put_on_hold_requires_reason_and_can_later_be_accepted(self):
+        sample = make_sample(self.analyst, barcode="BC-HOLD-1", state=SampleState.RECEIVED)
+        with self.assertRaises(ReasonRequired):
+            services.put_on_hold(sample=sample, user=self.analyst, reason_code="")
+
+        held = services.put_on_hold(
+            sample=sample, user=self.analyst, reason_code="AWAITING_DOCS"
+        )
+        self.assertEqual(held.state, SampleState.ON_HOLD)
+        self.assertEqual(held.acceptance_decision, AcceptanceDecision.ON_HOLD)
+
+        accepted = services.accept_sample(sample=held, user=self.analyst)
+        self.assertEqual(accepted.state, SampleState.ACCESSIONED)
+
+    def test_reject_requires_qa_capability(self):
+        sample = make_sample(self.analyst, barcode="BC-REJ-1", state=SampleState.RECEIVED)
+        with self.assertRaises(PermissionDenied):
+            services.reject_sample(
+                sample=sample, user=self.analyst, rejection_reason_code="R001"
+            )
+
+    def test_reject_requires_known_reason_code(self):
+        sample = make_sample(self.analyst, barcode="BC-REJ-2", state=SampleState.RECEIVED)
+        with self.assertRaises(RejectionReasonRequired):
+            services.reject_sample(
+                sample=sample, user=self.qa, rejection_reason_code="NOT_A_CODE"
+            )
+
+    def test_reject_other_requires_details(self):
+        sample = make_sample(self.analyst, barcode="BC-REJ-3", state=SampleState.RECEIVED)
+        with self.assertRaises(RejectionReasonRequired):
+            services.reject_sample(sample=sample, user=self.qa, rejection_reason_code="OTHER")
+
+    def test_reject_sets_qa_approval_reason_and_closes_placement(self):
+        box = make_hierarchy()["box"]
+        sample = make_sample(self.analyst, barcode="BC-REJ-4", state=SampleState.RECEIVED)
+        services.transfer(sample=sample, location=box, user=self.analyst, row_label="A", column_number=1)
+
+        result = services.reject_sample(
+            sample=sample,
+            user=self.qa,
+            rejection_reason_code="R001",
+            checklist={"container_integrity_ok": False},
+        )
+        self.assertEqual(result.state, SampleState.REJECTED)
+        self.assertEqual(result.rejection_reason_id, "R001")
+        self.assertEqual(result.qa_approved_by, self.qa)
+        self.assertIsNotNone(result.qa_approved_at)
+        self.assertFalse(result.container_integrity_ok)
+        self.assertEqual(
+            SamplePlacement.objects.filter(sample=sample, removed_at__isnull=True).count(), 0
+        )
+
+    def test_rejected_sample_can_then_be_disposed(self):
+        manager = make_user("manager2", role="lab_manager")
+        sample = make_sample(self.analyst, barcode="BC-REJ-5", state=SampleState.RECEIVED)
+        services.reject_sample(sample=sample, user=self.qa, rejection_reason_code="R004")
+
+        disposed = services.transition(
+            sample=sample,
+            new_state=SampleState.DISPOSED,
+            user=manager,
+            reason_code="REJECTED_SAMPLE_DISPOSAL",
+        )
+        self.assertEqual(disposed.state, SampleState.DISPOSED)
+
+    def test_mark_client_notified(self):
+        sample = make_sample(self.analyst, barcode="BC-REJ-6", state=SampleState.RECEIVED)
+        services.reject_sample(sample=sample, user=self.qa, rejection_reason_code="R001")
+        self.assertIsNone(Sample.objects.get(pk=sample.pk).client_notified_at)
+
+        notified = services.mark_client_notified(sample=sample, user=self.qa)
+        self.assertIsNotNone(notified.client_notified_at)
 
 
 class StorageQueryTests(TestCase):

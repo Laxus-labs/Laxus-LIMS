@@ -1,7 +1,10 @@
 import type {
+  AcceptanceChecklist,
   AccessionBatchResult,
+  Customer,
   Me,
   Paginated,
+  RejectionReasonCode,
   Sample,
   SamplePlacement,
   SampleState,
@@ -106,6 +109,7 @@ export async function apiFetch<T>(path: string, options: RequestOptions = {}, re
 export interface ScanInput {
   barcode: string;
   sample_type: string;
+  customer_id?: number;
   volume?: number;
   volume_unit?: string;
   subject_ref?: string;
@@ -130,6 +134,31 @@ export const api = {
 
   accessionSample: (id: string) => apiFetch<Sample>(`/samples/${id}/accession/`, { method: "POST" }),
 
+  acceptSample: (
+    id: string,
+    payload: {
+      with_deviation?: boolean;
+      deviation_notes?: string;
+      checklist?: AcceptanceChecklist;
+      reason_code?: string;
+      reason_text?: string;
+    }
+  ) => apiFetch<Sample>(`/samples/${id}/accept/`, { method: "POST", body: payload }),
+
+  holdSample: (
+    id: string,
+    payload: { reason_code: string; reason_text?: string; checklist?: AcceptanceChecklist }
+  ) => apiFetch<Sample>(`/samples/${id}/hold/`, { method: "POST", body: payload }),
+
+  rejectSample: (
+    id: string,
+    payload: { rejection_reason_code: string; reason_text?: string; checklist?: AcceptanceChecklist }
+  ) => apiFetch<Sample>(`/samples/${id}/reject/`, { method: "POST", body: payload }),
+
+  notifyClient: (id: string) => apiFetch<Sample>(`/samples/${id}/notify-client/`, { method: "POST" }),
+
+  rejectionReasons: () => apiFetch<RejectionReasonCode[]>("/samples/rejection-reasons/"),
+
   transferSample: (
     id: string,
     payload: { location_id: number; row_label?: string; column_number?: number; reason_code?: string; reason_text?: string }
@@ -152,4 +181,28 @@ export const api = {
   listLocations: () => apiFetch<StorageLocation[]>("/locations/"),
 
   locationContents: (id: number) => apiFetch<Sample[]>(`/locations/${id}/contents/`),
+
+  listCustomers: (params: { search?: string; is_active?: string; cursor?: string } = {}) =>
+    apiFetch<Paginated<Customer>>("/customers/", { params }),
+
+  createCustomer: (payload: {
+    name: string;
+    code: string;
+    category?: string;
+    contact_person?: string;
+    phone?: string;
+    email?: string;
+    billing_address?: string;
+    shipping_address?: string;
+    gst_number?: string;
+  }) => apiFetch<Customer>("/customers/", { method: "POST", body: payload }),
+
+  updateCustomer: (id: number, payload: Partial<Customer>) =>
+    apiFetch<Customer>(`/customers/${id}/`, { method: "PATCH", body: payload }),
+
+  deactivateCustomer: (id: number, reason_text?: string) =>
+    apiFetch<Customer>(`/customers/${id}/deactivate/`, { method: "POST", body: { reason_text } }),
+
+  reactivateCustomer: (id: number, reason_text?: string) =>
+    apiFetch<Customer>(`/customers/${id}/reactivate/`, { method: "POST", body: { reason_text } }),
 };

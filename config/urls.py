@@ -23,6 +23,7 @@ urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/', include('apps.samples.urls')),
     path('api/', include('apps.storage.urls')),
+    path('api/', include('apps.customers.urls')),
     path('api/', include('apps.accounts.urls')),
     path('api/auth/token/', TokenObtainPairView.as_view(), name='token_obtain_pair'),
     path('api/auth/token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),

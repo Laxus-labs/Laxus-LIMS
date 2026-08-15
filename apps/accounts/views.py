@@ -17,6 +17,7 @@ class MeView(APIView):
                 "can_review_results": user.can_review_results,
                 "can_approve_results": user.can_approve_results,
                 "can_dispose_samples": user.can_dispose_samples,
+                "can_approve_qa": user.can_approve_qa,
                 "can_adjust_inventory": user.can_adjust_inventory,
             }
         )

@@ -1,7 +1,7 @@
 from rest_framework.test import APITestCase
 
 from apps.samples.models import SampleState, SampleType
-from apps.samples.tests.factories import make_hierarchy, make_sample, make_user
+from apps.samples.tests.factories import make_customer, make_hierarchy, make_sample, make_user
 
 
 class SampleAPITests(APITestCase):
@@ -141,6 +141,86 @@ class SampleAPITests(APITestCase):
         search_resp = self.client.get("/api/samples/?search=BC-EXP-1")
         self.assertEqual(search_resp.status_code, 200)
         self.assertEqual(len(search_resp.data["results"]), 1)
+
+
+class AcceptanceReviewAPITests(APITestCase):
+    def setUp(self):
+        self.analyst = make_user("frontdesk2", role="analyst")
+        self.qa = make_user("qa2", role="qa_approver")
+        self.customer = make_customer(self.analyst, code="CUST-API-1")
+
+    def test_accept_endpoint(self):
+        sample = make_sample(self.analyst, barcode="BC-API-ACC-1", customer=self.customer)
+        self.client.force_authenticate(user=self.analyst)
+        resp = self.client.post(
+            f"/api/samples/{sample.pk}/accept/",
+            {"checklist": {"container_integrity_ok": True}},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertEqual(resp.data["state"], "accessioned")
+        self.assertEqual(resp.data["acceptance_decision"], "accepted")
+        self.assertTrue(resp.data["container_integrity_ok"])
+        self.assertEqual(resp.data["customer"]["code"], "CUST-API-1")
+
+    def test_hold_then_reject_requires_qa_role(self):
+        sample = make_sample(self.analyst, barcode="BC-API-HOLD-1")
+        self.client.force_authenticate(user=self.analyst)
+
+        hold_resp = self.client.post(
+            f"/api/samples/{sample.pk}/hold/", {"reason_code": "AWAITING_DOCS"}, format="json"
+        )
+        self.assertEqual(hold_resp.status_code, 200, hold_resp.data)
+        self.assertEqual(hold_resp.data["state"], "on_hold")
+
+        forbidden = self.client.post(
+            f"/api/samples/{sample.pk}/reject/",
+            {"rejection_reason_code": "R005"},
+            format="json",
+        )
+        self.assertEqual(forbidden.status_code, 403, forbidden.data)
+
+        self.client.force_authenticate(user=self.qa)
+        rejected = self.client.post(
+            f"/api/samples/{sample.pk}/reject/",
+            {"rejection_reason_code": "R005"},
+            format="json",
+        )
+        self.assertEqual(rejected.status_code, 200, rejected.data)
+        self.assertEqual(rejected.data["state"], "rejected")
+        self.assertEqual(rejected.data["rejection_reason"]["code"], "R005")
+        self.assertEqual(rejected.data["qa_approved_by"], "qa2")
+
+    def test_reject_other_requires_reason_text(self):
+        sample = make_sample(self.analyst, barcode="BC-API-OTHER-1")
+        self.client.force_authenticate(user=self.qa)
+        resp = self.client.post(
+            f"/api/samples/{sample.pk}/reject/", {"rejection_reason_code": "OTHER"}, format="json"
+        )
+        self.assertEqual(resp.status_code, 400, resp.data)
+
+        resp2 = self.client.post(
+            f"/api/samples/{sample.pk}/reject/",
+            {"rejection_reason_code": "OTHER", "reason_text": "Sent to wrong lab."},
+            format="json",
+        )
+        self.assertEqual(resp2.status_code, 200, resp2.data)
+
+    def test_notify_client_and_rejection_reasons_list(self):
+        sample = make_sample(self.analyst, barcode="BC-API-NOTIFY-1")
+        self.client.force_authenticate(user=self.qa)
+        self.client.post(
+            f"/api/samples/{sample.pk}/reject/", {"rejection_reason_code": "R002"}, format="json"
+        )
+        notify = self.client.post(f"/api/samples/{sample.pk}/notify-client/")
+        self.assertEqual(notify.status_code, 200, notify.data)
+        self.assertIsNotNone(notify.data["client_notified_at"])
+
+        reasons = self.client.get("/api/samples/rejection-reasons/")
+        self.assertEqual(reasons.status_code, 200)
+        codes = {r["code"] for r in reasons.data}
+        self.assertIn("R001", codes)
+        self.assertIn("OTHER", codes)
 
 
 class LocationAndMeAPITests(APITestCase):

@@ -33,8 +33,25 @@ from .errors import (
     PermissionDenied,
     PositionOccupied,
     ReasonRequired,
+    RejectionReasonRequired,
 )
-from .models import ALLOWED_TRANSITIONS, Sample, SamplePlacement, SampleState
+from .models import (
+    ALLOWED_TRANSITIONS,
+    AcceptanceDecision,
+    RejectionReasonCode,
+    Sample,
+    SamplePlacement,
+    SampleState,
+)
+
+CHECKLIST_FIELDS = (
+    "container_integrity_ok",
+    "seal_integrity_ok",
+    "quantity_ok",
+    "label_ok",
+    "documentation_ok",
+    "transport_conditions_ok",
+)
 
 
 @dataclass
@@ -114,6 +131,7 @@ def accession_batch(
                         barcode=barcode,
                         sample_type=scan["sample_type"],
                         state=SampleState.RECEIVED,
+                        customer=scan.get("customer"),
                         volume=Decimal(str(scan.get("volume", 0))),
                         volume_unit=scan.get("volume_unit", "uL"),
                         subject_ref=scan.get("subject_ref", ""),
@@ -143,6 +161,169 @@ def accession(*, sample: Sample, user, reason_code: str = "ACCESSION") -> Sample
         sample.accessioned_at = timezone.now()
         sample.state = SampleState.ACCESSIONED
         sample.save(update_fields=["accession_number", "accessioned_at", "state", "updated_at"])
+    return sample
+
+
+def _apply_checklist(sample: Sample, checklist: dict[str, bool | None]) -> list[str]:
+    fields = []
+    for name in CHECKLIST_FIELDS:
+        if name in checklist:
+            setattr(sample, name, checklist[name])
+            fields.append(name)
+    return fields
+
+
+@transaction.atomic
+def accept_sample(
+    *,
+    sample: Sample,
+    user,
+    with_deviation: bool = False,
+    deviation_notes: str = "",
+    checklist: dict[str, bool | None] | None = None,
+    reason_code: str = "ACCEPTANCE",
+    reason_text: str = "",
+) -> Sample:
+    """
+    Pass the pre-testing acceptance review and advance to ACCESSIONED.
+
+    Distinct from the plain `accession()` above: this is the gated path the
+    spec calls for — a checklist, a decision (accepted / accepted with
+    deviation), and a lab identifier assignment, all as one event. Deviation
+    notes are required when accepting with a deviation; an accepted sample
+    with an unexplained deviation is worse than a rejected one, because it
+    looks clean.
+    """
+    sample = Sample.objects.select_for_update().get(pk=sample.pk)
+    _assert_transition(sample, SampleState.ACCESSIONED)
+
+    if with_deviation and not deviation_notes.strip():
+        raise ReasonRequired("Accepting with a deviation requires deviation notes.")
+
+    with audit_context.reason(reason_code, reason_text):
+        fields = _apply_checklist(sample, checklist or {})
+        sample.accession_number = sample.accession_number or _next_accession_number()
+        sample.accessioned_at = timezone.now()
+        sample.state = SampleState.ACCESSIONED
+        sample.acceptance_decision = (
+            AcceptanceDecision.ACCEPTED_WITH_DEVIATION
+            if with_deviation
+            else AcceptanceDecision.ACCEPTED
+        )
+        sample.deviation_notes = deviation_notes if with_deviation else ""
+        sample.save(
+            update_fields=fields
+            + [
+                "accession_number",
+                "accessioned_at",
+                "state",
+                "acceptance_decision",
+                "deviation_notes",
+                "updated_at",
+            ]
+        )
+    return sample
+
+
+@transaction.atomic
+def put_on_hold(
+    *,
+    sample: Sample,
+    user,
+    reason_code: str,
+    reason_text: str = "",
+    checklist: dict[str, bool | None] | None = None,
+) -> Sample:
+    """Park a sample whose acceptance review raised a question that needs
+    chasing down, without forcing an accept/reject decision yet."""
+    if not reason_code:
+        raise ReasonRequired("Placing a sample on hold requires a reason code.")
+
+    sample = Sample.objects.select_for_update().get(pk=sample.pk)
+    _assert_transition(sample, SampleState.ON_HOLD)
+
+    with audit_context.reason(reason_code, reason_text):
+        fields = _apply_checklist(sample, checklist or {})
+        sample.state = SampleState.ON_HOLD
+        sample.acceptance_decision = AcceptanceDecision.ON_HOLD
+        sample.save(update_fields=fields + ["state", "acceptance_decision", "updated_at"])
+    return sample
+
+
+@transaction.atomic
+def reject_sample(
+    *,
+    sample: Sample,
+    user,
+    rejection_reason_code: str,
+    reason_text: str = "",
+    checklist: dict[str, bool | None] | None = None,
+) -> Sample:
+    """
+    Reject a sample before testing begins.
+
+    Two invariants are enforced twice, same pattern as everywhere else in
+    this module: a readable error here, and a CHECK constraint on `sample`
+    that holds regardless of which code path performed the write —
+    `sample_rejected_requires_reason` and
+    `sample_rejected_requires_qa_approval`.
+
+    - A rejection reason code is mandatory, and codes flagged
+      `requires_details` (e.g. "Other") also require reason_text.
+    - Only a QA-capable role may reject. There is no separate propose/
+      approve step; the actor calling this *is* the QA approval, recorded
+      as `qa_approved_by` — the same shape as `can_dispose_samples` gating
+      `transition()` to DISPOSED.
+    """
+    if not getattr(user, "can_approve_qa", False):
+        raise PermissionDenied("This role may not reject samples; QA approval is required.")
+
+    try:
+        reason = RejectionReasonCode.objects.get(code=rejection_reason_code, is_active=True)
+    except RejectionReasonCode.DoesNotExist as exc:
+        raise RejectionReasonRequired(
+            f"'{rejection_reason_code}' is not a known, active rejection reason code."
+        ) from exc
+    if reason.requires_details and not reason_text.strip():
+        raise RejectionReasonRequired(f"Reason code '{reason.code}' requires reason_text.")
+
+    sample = Sample.objects.select_for_update().get(pk=sample.pk)
+    _assert_transition(sample, SampleState.REJECTED)
+
+    with audit_context.reason(f"REJECT:{reason.code}", reason_text):
+        fields = _apply_checklist(sample, checklist or {})
+        sample.state = SampleState.REJECTED
+        sample.acceptance_decision = AcceptanceDecision.REJECTED
+        sample.rejection_reason = reason
+        sample.rejection_reason_other = reason_text if reason.requires_details else ""
+        sample.qa_approved_by = user
+        sample.qa_approved_at = timezone.now()
+        sample.save(
+            update_fields=fields
+            + [
+                "state",
+                "acceptance_decision",
+                "rejection_reason",
+                "rejection_reason_other",
+                "qa_approved_by",
+                "qa_approved_at",
+                "updated_at",
+            ]
+        )
+        SamplePlacement.objects.filter(sample=sample, removed_at__isnull=True).update(
+            removed_at=timezone.now(), removed_by=user, reason_code=f"REJECT:{reason.code}"
+        )
+    return sample
+
+
+@transaction.atomic
+def mark_client_notified(*, sample: Sample, user) -> Sample:
+    """Record that the client has been told about a rejected sample.
+    Deliberately just a timestamp — actually sending the notification
+    (email/SMS) is an integration this module does not own."""
+    sample = Sample.objects.select_for_update().get(pk=sample.pk)
+    sample.client_notified_at = timezone.now()
+    sample.save(update_fields=["client_notified_at", "updated_at"])
     return sample
 
 

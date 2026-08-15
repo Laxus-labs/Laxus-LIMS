@@ -39,6 +39,7 @@ INSTALLED_APPS = [
     "apps.accounts",
     "apps.audit",
     "apps.storage",
+    "apps.customers",
     "apps.samples",
     "apps.testing",
     "apps.inventory",

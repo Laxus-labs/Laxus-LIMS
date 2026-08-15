@@ -20,6 +20,7 @@ from apps.samples.errors import (
     PermissionDenied as SamplePermissionDenied,
     PositionOccupied,
     ReasonRequired,
+    RejectionReasonRequired,
 )
 
 STATUS_BY_EXCEPTION = {
@@ -28,6 +29,7 @@ STATUS_BY_EXCEPTION = {
     InvalidPosition: status.HTTP_400_BAD_REQUEST,
     InsufficientVolume: status.HTTP_400_BAD_REQUEST,
     ReasonRequired: status.HTTP_400_BAD_REQUEST,
+    RejectionReasonRequired: status.HTTP_400_BAD_REQUEST,
     SamplePermissionDenied: status.HTTP_403_FORBIDDEN,
 }
 
