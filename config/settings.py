@@ -43,6 +43,8 @@ INSTALLED_APPS = [
     "apps.samples",
     "apps.testing",
     "apps.inventory",
+    "apps.core",
+    "apps.microbiology",
 ]
 
 MIDDLEWARE = [
